@@ -129,4 +129,4 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     step=[4])
 evaluation = dict(interval=6, metric='mAP')
-optimizer = dict(lr=0.05)
+optimizer = dict(lr=0.0125)

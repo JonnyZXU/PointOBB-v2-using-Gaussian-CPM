@@ -4,7 +4,7 @@ _base_ = [
 ]
 
 angle_version = 'le90'
-data_root = 'data/split_ss_dota_v10/'
+data_root = 'data/split_ss_dota/'
 classes = ('plane', 'baseball-diamond', 'bridge', 'ground-track-field',
            'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
            'basketball-court', 'storage-tank', 'soccer-ball-field',
@@ -216,4 +216,4 @@ model = dict(
             nms=dict(iou_thr=0.1),
             max_per_img=2000)))
 
-optimizer = dict(lr=0.01)
+optimizer = dict(lr=0.005)
