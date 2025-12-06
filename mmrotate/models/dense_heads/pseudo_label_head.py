@@ -14,6 +14,8 @@ from .rotated_fcos_head import RotatedFCOSHead
 import numpy as np
 import os
 from PIL import Image
+from mmrotate.core.bbox.transforms_reppoints import points_to_rbox_minarea
+
 
 INF = 1e8
 
@@ -422,33 +424,61 @@ class PseudoLabelHead(RotatedFCOSHead):
         gt_ctr_rect = self.get_rectangle_cls_prob(cls_scores_all[0].sigmoid(), self.strides[0], center_factor, center_point_gt, pca_length, mode='near')
         # gt_ctr_rect = self.process_rectangle_decay(gt_ctr_rect.detach().clone())
         
-        # get the PCA of each gt rectangle
-        gt_ctr_rect_label = gt_ctr_rect[torch.arange(num_gts), gt_labels, :, :] # [num_gts, pca_length, pca_length]
-        gt_rect_ctr2edge = gt_ctr_rect_label.shape[-1]//2
-        points_rect_x = torch.arange(-gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1).to(gt_ctr_rect.device)
-        points_rect_y = torch.arange(-gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1).to(gt_ctr_rect.device)
-        points_rect_xy = torch.stack(torch.meshgrid(points_rect_x, points_rect_y), -1).reshape(-1, 2) # [pca_length^2, 2]
-        gt_ctr_rect_label = gt_ctr_rect_label.transpose(1, 2).contiguous().view(num_gts, -1) # [num_gts, pca_length^2]
-        points_rect_xy_adapt = points_rect_xy.unsqueeze(0).repeat(num_gts, 1, 1) * torch.sqrt(gt_ctr_rect_label).unsqueeze(-1) # [num_gts, pca_length^2, 2] 
-        points_cov_matrix = torch.matmul(points_rect_xy_adapt.transpose(1, 2), points_rect_xy_adapt) / (gt_ctr_rect_label.shape[-1] ** 2 - 1) # [num_gts, 2, 2]
-        eigvals, eigvecs = torch.symeig(points_cov_matrix, eigenvectors=True)
-        
-        # get the largest eigval and the corresponding eigvec
-        larger_eigvals_index = (eigvals[:, 1] > eigvals[:, 0]).int()
-        eigval_first = eigvals[:, 0] * (1 - larger_eigvals_index) + eigvals[:, 1] * larger_eigvals_index
-        eigvec_first = eigvecs[:, 0, :] * (1 - larger_eigvals_index).unsqueeze(1).repeat(1, 2) + eigvecs[:, 1, :] * larger_eigvals_index.unsqueeze(1).repeat(1, 2)
-        # eigvec_first = eigvec_first + 1e-6 # [num_gts, 2]
+        ######################################### CHANGED #########################################
+
+        # get the PCA of each gt rectangle (replaced by ORP-style minAreaRect)
+        gt_ctr_rect_label = gt_ctr_rect[torch.arange(num_gts), gt_labels, :, :]  # [num_gts, pca_length, pca_length]
+        gt_rect_ctr2edge = gt_ctr_rect_label.shape[-1] // 2
+
+        points_rect_x = torch.arange(
+            -gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1, device=gt_ctr_rect.device
+        )
+        points_rect_y = torch.arange(
+            -gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1, device=gt_ctr_rect.device
+        )
+        points_rect_xy = torch.stack(
+            torch.meshgrid(points_rect_x, points_rect_y), -1
+        ).reshape(-1, 2)  # [pca_length^2, 2]
+
+        # gt_ctr_rect_label: [num_gts, pca_length, pca_length] -> [num_gts, pca_length^2]
+        gt_ctr_rect_label = gt_ctr_rect_label.transpose(1, 2).contiguous().view(num_gts, -1)
+
+        # weighted points for each gt: [num_gts, pca_length^2, 2]
+        points_rect_xy_adapt = (
+            points_rect_xy.unsqueeze(0).repeat(num_gts, 1, 1)
+            * torch.sqrt(gt_ctr_rect_label).unsqueeze(-1)
+        )
+
+        # -------- ORP-style orientation: use minAreaRect on adapted points --------
+        # rrects: [num_gts, 5] = [cx_local, cy_local, w_local, h_local, angle_rad]
+        rrects = points_to_rbox_minarea(points_rect_xy_adapt)
+
+        widths = rrects[:, 2]
+        heights = rrects[:, 3]
+        theta = rrects[:, 4]  # radians
+
+        # choose major axis as "first eigenvector"
+        major_is_width = (widths >= heights).float().unsqueeze(-1)  # [num_gts, 1]
+
+        # unit vectors for width and height directions in local coords
+        v_width = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)   # [num_gts, 2]
+        v_height = torch.stack([-torch.sin(theta), torch.cos(theta)], dim=-1) # [num_gts, 2]
+
+        eigvec_first = v_width * major_is_width + v_height * (1.0 - major_is_width)  # [num_gts, 2]
+        eigvec_second = torch.stack([-eigvec_first[:, 1], eigvec_first[:, 0]], dim=-1)
+
+        # keep same angle convention as original code
         mask_eigvec = (eigvec_first[:, 1] > 0).int()
         epsilon = mask_eigvec * 1e-6 + (1 - mask_eigvec) * -1e-6
-        
-        # get the angle target (only for le90)
-        angle_targets = -torch.atan(eigvec_first[:, 0] / (eigvec_first[:, 1] + epsilon)).unsqueeze(-1)
-        
-        # get the second axis direction
-        eigvec_second = torch.stack([-eigvec_first[:, 1], eigvec_first[:, 0]], -1)
-        
-        first_axis_range = self.get_closest_gt_first_axis(gt_labels, eigvec_first, center_point_gt, angle_threshold=0.866)
-        
+        angle_targets = -torch.atan(
+            eigvec_first[:, 0] / (eigvec_first[:, 1] + epsilon)
+        ).unsqueeze(-1)
+
+        first_axis_range = self.get_closest_gt_first_axis(
+            gt_labels, eigvec_first, center_point_gt, angle_threshold=0.866
+        )
+        ######################################### CHANGED #########################################
+
         top_simple, bottom_simple = self.get_edge_boundary_simple(gt_labels, eigvec_first, center_point_gt, cls_scores_all, thresh3, default_max_length, mode='simple',
                                                                   is_secondary=False, is_nearest_same_class=is_nearest_same_class, nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index], first_axis_range=first_axis_range) 
         left_simple, right_simple = self.get_edge_boundary_simple(gt_labels, eigvec_second, center_point_gt, cls_scores_all, thresh3, default_max_length, mode='simple', 
