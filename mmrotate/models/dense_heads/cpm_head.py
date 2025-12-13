@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
 import torch
+import math
 import torch.nn as nn
 from mmcv.cnn import Scale
 from mmcv.runner import force_fp32
@@ -16,6 +17,65 @@ from PIL import Image
 
 INF = 1e8
 
+
+def gaussian_radius(det_size, min_overlap=0.7):
+        """Approximate CenterNet gaussian radius. det_size is (h, w)."""
+        h, w = det_size[0], det_size[1]
+
+        a1 = 1
+        b1 = h + w
+        c1 = w * h * (1 - min_overlap) / (1 + min_overlap)
+        sq1 = b1 ** 2 - 4 * a1 * c1
+        sq1 = torch.clamp(sq1, min=0.0)
+        r1 = (b1 + torch.sqrt(sq1)) / 2
+
+        a2 = 4
+        b2 = 2 * (h + w)
+        c2 = (1 - min_overlap) * w * h
+        sq2 = b2 ** 2 - 4 * a2 * c2
+        sq2 = torch.clamp(sq2, min=0.0)
+        r2 = (b2 + torch.sqrt(sq2)) / 2
+
+        a3 = 4 * min_overlap
+        b3 = -2 * min_overlap * (h + w)
+        c3 = (min_overlap - 1) * w * h
+        sq3 = b3 ** 2 - 4 * a3 * c3
+        sq3 = torch.clamp(sq3, min=0.0)
+        r3 = (b3 + torch.sqrt(sq3)) / 2
+
+        return torch.min(torch.min(r1, r2), r3)
+
+
+def draw_gaussian(heatmap, center, radius, k=1.0):
+    """Draw a 2D Gaussian on `heatmap` (H,W) at given center (x,y)."""
+    x, y = int(center[0]), int(center[1])
+    height, width = heatmap.shape[-2:]
+
+    if x < 0 or y < 0 or x >= width or y >= height:
+        return
+
+    diameter = 2 * radius + 1
+    sigma = diameter / 6.0
+
+    ys = torch.arange(0, diameter, device=heatmap.device) - radius
+    xs = torch.arange(0, diameter, device=heatmap.device) - radius
+    yy, xx = torch.meshgrid(ys, xs)
+    gaussian = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+
+    left   = max(0, x - radius)
+    right  = min(width, x + radius + 1)
+    top    = max(0, y - radius)
+    bottom = min(height, y + radius + 1)
+
+    g_left   = left - (x - radius)
+    g_right  = g_left + (right - left)
+    g_top    = top - (y - radius)
+    g_bottom = g_top + (bottom - top)
+
+    patch = heatmap[top:bottom, left:right]
+    g_patch = gaussian[g_top:g_bottom, g_left:g_right]
+
+    torch.maximum(patch, g_patch * k, out=patch)
 
 @ROTATED_HEADS.register_module()
 class CPMHead(RotatedFCOSHead):
@@ -96,7 +156,13 @@ class CPMHead(RotatedFCOSHead):
             self.train_duration = train_cfg['vis_train_duration']
         if 'visualize' in train_cfg:
             self.visualize = train_cfg['visualize']
-        
+
+        # NEW: gaussian heatmap options
+        self.heatmap_mode = train_cfg.get('heatmap_mode', 'pointobbv2')
+        self.hm_alpha = train_cfg.get('heatmap_alpha', 2.0)
+        self.hm_beta = train_cfg.get('heatmap_beta', 4.0)
+
+
     def get_mask_image(self, max_probs, max_indices, thr, num_width):
         PALETTE = [
             (165, 42, 42), (189, 183, 107), (0, 255, 0), (255, 0, 0),
@@ -185,6 +251,8 @@ class CPMHead(RotatedFCOSHead):
             featmap_sizes,
             dtype=bbox_preds[0].dtype,
             device=bbox_preds[0].device)
+        if self.heatmap_mode == 'gaussian':                                     # new
+            return self._loss_gaussian(cls_scores, gt_bboxes, gt_labels)        # new
         labels = self.get_targets(
             all_level_points, gt_bboxes, gt_labels)
         
@@ -253,6 +321,97 @@ class CPMHead(RotatedFCOSHead):
                 loss_cls=self.cls_weight * loss_cls,
                 loss_bbox=0. * loss_cls,
                 loss_centerness=0. * loss_cls)
+
+    def _loss_gaussian(self, cls_scores, gt_bboxes, gt_labels):                                                 # NEW FUNCTION
+        """
+        CenterNet-style Gaussian heatmap loss.
+
+        cls_scores: list of [B, C, H_l, W_l]
+        gt_bboxes: list of [N_i, 5] (cx, cy, w, h, angle) or [N_i, 4]
+        gt_labels: list of [N_i]
+        """
+        num_levels = len(cls_scores)
+        batch_size = cls_scores[0].size(0)
+        num_classes = self.num_classes
+
+        # build empty target heatmaps per level
+        target_hms = []
+        for lvl, feat in enumerate(cls_scores):
+            _, _, H, W = feat.shape
+            target_hms.append(feat.new_zeros((batch_size, num_classes, H, W)))
+
+        # fill targets
+        for b in range(batch_size):
+            if gt_bboxes[b].numel() == 0:
+                continue
+            bboxes = gt_bboxes[b]
+            labels = gt_labels[b]
+
+            for n in range(bboxes.size(0)):
+                cls_id = int(labels[n].item())
+                if cls_id < 0 or cls_id >= num_classes:
+                    continue
+
+                # assume gt_bboxes are (cx, cy, w, h, angle)
+                cx, cy, w, h = bboxes[n][0], bboxes[n][1], bboxes[n][2], bboxes[n][3]
+
+                for lvl in range(num_levels):
+                    stride = self.prior_generator.strides[lvl][0]  # e.g. 4, 8, 16...
+                    _, _, H, W = cls_scores[lvl].shape
+
+                    fx = cx / stride
+                    fy = cy / stride
+                    if fx < 0 or fy < 0 or fx >= W or fy >= H:
+                        continue
+
+                    # object size in feature coordinates
+                    fw = w / stride
+                    fh = h / stride
+                    det_size = torch.tensor([fh, fw], device=bboxes.device)
+
+                    radius = gaussian_radius(det_size, min_overlap=0.7)
+                    radius = int(max(0, torch.floor(radius).item()))
+
+                    draw_gaussian(target_hms[lvl][b, cls_id], (fx, fy), radius)
+
+        # CenterNet focal loss
+        total_loss = 0.0
+        total_elems = 0
+
+        for lvl, pred in enumerate(cls_scores):
+            # [B, C, H, W]
+            pred_sigmoid = pred.sigmoid()
+            target = target_hms[lvl]
+
+            pos_inds = (target == 1)
+            neg_inds = (target < 1)
+
+            # positive loss: -(1 - p)^alpha * log(p)
+            pos_loss = -torch.log(pred_sigmoid + 1e-6) * ((1 - pred_sigmoid) ** self.hm_alpha)
+            pos_loss = pos_loss * pos_inds.float()
+
+            # negative loss: -(1 - y)^beta * p^alpha * log(1 - p)
+            neg_weight = ((1 - target) ** self.hm_beta)
+            neg_loss = -torch.log(1 - pred_sigmoid + 1e-6) \
+                    * (pred_sigmoid ** self.hm_alpha) \
+                    * neg_weight * neg_inds.float()
+
+            loss = pos_loss + neg_loss
+
+            total_loss = total_loss + loss.sum()
+            total_elems += pos_inds.sum().item() + neg_inds.sum().item()
+
+        if total_elems == 0:
+            total_elems = 1.0
+
+        loss_cls = total_loss / total_elems
+
+        # we only care about cls loss in CPM
+        return dict(
+            loss_cls=self.cls_weight * loss_cls,
+            loss_bbox=pred.new_tensor(0.0),
+            loss_centerness=pred.new_tensor(0.0),
+        )
 
     def get_targets(self, points, gt_bboxes_list, gt_labels_list):
         """Compute regression, classification and centerness targets for points

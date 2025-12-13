@@ -110,7 +110,7 @@ model = dict(
         cls_weight=1.0,
         thresh3=[0.03, 0.04, 0.1, 0.01, 0.10, 0.06, 0.08, 0.02, 0.01, 0.03, 0.005, 0.02, 0.05, 0.1, 0.015],
         pca_length=20,
-        store_ann_dir='data/pseudo_labels/',
+        store_ann_dir='data/pseudo_labels4/',
         multiple_factor=1/4
         ),
     test_cfg=dict(

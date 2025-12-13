@@ -5,7 +5,7 @@ _base_ = [
 
 data_root = 'data/split_ss_dota/'
 
-store_dir = '/content/drive/MyDrive/PointOBB-v2/vis_out/pointobb'
+store_dir = '/Users/jonat/OneDrive/Desktop/College/Year 4/ECE4990 Deep Learning/Paper Presentation DL/PointOBB-v2-using-BBAVectors/work_dirs/vis-out'
 
 angle_version = 'le90'
 
@@ -19,7 +19,7 @@ img_norm_cfg = dict(
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', with_bbox=True),
-    dict(type='RResize', img_scale=(1024, 1024)),
+    dict(type='RResize', img_scale=(800, 800)),
     dict(
         type='RRandomFlip',
         flip_ratio=[0.25, 0.25, 0.25],
@@ -53,7 +53,7 @@ data = dict(
         img_prefix=data_root + 'test/images/',
         version=angle_version,
         classes=classes,
-        samples_per_gpu=4))
+        samples_per_gpu=1))
 
 # model settings
 model = dict(
@@ -129,4 +129,4 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     step=[4])
 evaluation = dict(interval=6, metric='mAP')
-optimizer = dict(lr=0.0125)
+optimizer = dict(lr=0.05)

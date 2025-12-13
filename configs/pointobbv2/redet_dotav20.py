@@ -45,7 +45,7 @@ data = dict(
         img_prefix=data_root + 'test/images/',
         version=angle_version,
         classes=classes,
-        samples_per_gpu=4))
+        samples_per_gpu=1))
 
 angle_version = 'le90'
 model = dict(
